@@ -975,16 +975,16 @@ iconinit(void)
 
 	if(tagcols[BACK] == nil) {
 		/* Blue */
-		tagcols[BACK] = allocimagemix(display, DPalebluegreen, DWhite);
-		tagcols[HIGH] = allocimage(display, Rect(0,0,1,1), screen->chan, 1, DPalegreygreen);
-		tagcols[BORD] = allocimage(display, Rect(0,0,1,1), screen->chan, 1, DPurpleblue);
+		tagcols[BACK] = allocimage(display, Rect(0,0,1,1), screen->chan, 1, 0xf0f0f0ff);
+		tagcols[HIGH] = allocimage(display, Rect(0,0,1,1), screen->chan, 1, 0xb6dafdff);
+		tagcols[BORD] = allocimage(display, Rect(0,0,1,1), screen->chan, 1, DBlack);
 		tagcols[TEXT] = display->black;
 		tagcols[HTEXT] = display->black;
 	
 		/* Yellow */
-		textcols[BACK] = allocimagemix(display, DPaleyellow, DWhite);
-		textcols[HIGH] = allocimage(display, Rect(0,0,1,1), screen->chan, 1, DDarkyellow);
-		textcols[BORD] = allocimage(display, Rect(0,0,1,1), screen->chan, 1, DYellowgreen);
+		textcols[BACK] = allocimage(display, Rect(0,0,1,1), screen->chan, 1, 0xfaf0e6ff);
+		textcols[HIGH] = allocimage(display, Rect(0,0,1,1), screen->chan, 1, 0xb6dafdff);
+		textcols[BORD] = allocimage(display, Rect(0,0,1,1), screen->chan, 1, 0xaaaaaaff);
 		textcols[TEXT] = display->black;
 		textcols[HTEXT] = display->black;
 	}
