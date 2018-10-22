@@ -35,6 +35,9 @@ latin1.h: $PLAN9/lib/keyboard $O.mklatinkbd
 $O.macargv: $MACARGV
 	$LD -o $target $prereq
 
+cocoa-screen-mojave-objc.$O: cocoa-screen-mojave.m
+	$CC $CFLAGS $OBJCFLAGS -o $target cocoa-screen-mojave.m
+
 %-objc.$O: %.m
 	$CC $CFLAGS -o $target $stem.m
 
