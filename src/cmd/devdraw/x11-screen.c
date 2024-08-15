@@ -396,9 +396,9 @@ runxevent(XEvent *xev)
 		be = (XButtonEvent*)xev;
 		if(be->button == 1) {
 			if(_x.kstate & ControlMask)
-				be->button = 2;
-			else if(_x.kstate & Mod1Mask)
 				be->button = 3;
+			else if(_x.kstate & Mod1Mask)
+				be->button = 2;
 		}
 		// fall through
 	case ButtonRelease:
@@ -473,9 +473,9 @@ runxevent(XEvent *xev)
 				_x.altdown = 0; // used alt
 				_x.kbuttons = 0;
 				if(c & ControlMask)
-					_x.kbuttons |= 2;
-				if(c & Mod1Mask)
 					_x.kbuttons |= 4;
+				if(c & Mod1Mask)
+					_x.kbuttons |= 2;
 				if(c & ShiftMask)
 					shift = 5;
 				gfx_mousetrack(w->client, m.xy.x, m.xy.y, (m.buttons|_x.kbuttons)<<shift, m.msec);
@@ -602,6 +602,8 @@ xattach(Client *client, char *label, char *winsize)
 		}
 		havemin = 0;
 	}
+	// Force 224 pixels-per-inch (MacBook Air M2).
+	client->displaydpi = 224;
 	w = newxwin(client);
 
 	memset(&attr, 0, sizeof attr);
