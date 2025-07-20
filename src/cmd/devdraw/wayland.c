@@ -18,6 +18,7 @@
 #include "bigarrow.h"
 #include "devdraw.h"
 #include "wayland-pointer-constraints.h"
+#include "wayland-xdg-activation.h"
 #include "wayland-xdg-decoration.h"
 #include "wayland-xdg-shell.h"
 
@@ -110,6 +111,7 @@ uint32_t keyboard_enter_serial;
 
 // Optional global wayland objects.
 // Need to NULL check them before using.
+static struct xdg_activation_v1 *activation_manager;
 static struct zxdg_decoration_manager_v1 *decoration_manager;
 static struct zwp_pointer_constraints_v1 *pointer_constraints;
 
@@ -168,6 +170,10 @@ static void registry_global(void *data, struct wl_registry *wl_registry,
 
 	} else if (strcmp(interface, wl_data_device_manager_interface.name) == 0) {
 		wl_data_device_manager = wl_registry_bind(wl_registry, name, &wl_data_device_manager_interface, 2);
+	
+	} else if (strcmp(interface, xdg_activation_v1_interface.name) == 0) {
+		activation_manager = wl_registry_bind(wl_registry, name,
+			&xdg_activation_v1_interface, 1);
 
 	} else if (strcmp(interface, zxdg_decoration_manager_v1_interface.name) == 0) {
 		decoration_manager = wl_registry_bind(wl_registry, name,
@@ -1136,6 +1142,14 @@ Memimage *rpc_attach(Client *c, char *label, char *winsize) {
 	wl->xdg_toplevel = xdg_surface_get_toplevel(wl->xdg_surface);
 	xdg_toplevel_add_listener(wl->xdg_toplevel, &xdg_toplevel_listener, c);
 	xdg_toplevel_set_title(wl->xdg_toplevel, label);
+	
+	if (activation_manager != NULL) {
+		const char *token = getenv("XDG_ACTIVATION_TOKEN");
+		if (token) {
+			xdg_activation_v1_activate(activation_manager, token, wl->wl_surface);
+			unsetenv("XDG_ACTIVATION_TOKEN");
+		}
+	}
 
 	wl->wl_pointer = wl_seat_get_pointer(wl_seat);
 	wl_pointer_add_listener(wl->wl_pointer, &pointer_listener, c);
