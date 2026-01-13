@@ -66,6 +66,17 @@ struct WaylandClient {
 	// Initial configure call is complete
 	int configured;
 
+	// Current decoration mode; client-side means we draw simple borders.
+	int decoration_mode;
+	struct zxdg_toplevel_decoration_v1 *xdg_decoration;
+
+	// Surface size in buffer pixels (may include CSD border).
+	int surface_w;
+	int surface_h;
+	int csd_thickness;
+	int content_offset_x;
+	int content_offset_y;
+
 	// These are called each frame while the key is pressed
 	// or scrolling is active, to implement key repeat and
 	// inertial scrolling.
@@ -363,6 +374,53 @@ static const struct wl_buffer_listener wl_buffer_listener = {
 	.release = wl_buffer_release,
 };
 
+#define CSD_BORDER_THICKNESS 4
+#define CSD_MIN_CONTENT_W 64
+#define CSD_MIN_CONTENT_H 48
+
+static int csd_border_thickness(void) {
+	return CSD_BORDER_THICKNESS * wl_output_scale_factor;
+}
+
+static void update_csd_metrics(WaylandClient *wl) {
+	if (wl->decoration_mode == ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE) {
+		wl->csd_thickness = csd_border_thickness();
+	} else {
+		wl->csd_thickness = 0;
+	}
+	wl->content_offset_x = wl->csd_thickness;
+	wl->content_offset_y = wl->csd_thickness;
+}
+
+static void set_csd_min_size(WaylandClient *wl) {
+	int min_w = CSD_MIN_CONTENT_W;
+	int min_h = CSD_MIN_CONTENT_H;
+	if (wl->decoration_mode == ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE) {
+		min_w += 2 * CSD_BORDER_THICKNESS;
+		min_h += 2 * CSD_BORDER_THICKNESS;
+	}
+	xdg_toplevel_set_min_size(wl->xdg_toplevel, min_w, min_h);
+}
+
+static void xdg_toplevel_decoration_configure(void *data,
+	struct zxdg_toplevel_decoration_v1 *decoration, uint32_t mode) {
+	Client* c = data;
+	WaylandClient *wl = (WaylandClient*) c->view;
+	qlock(&wayland_lock);
+	wl->decoration_mode = mode;
+	update_csd_metrics(wl);
+	if (mode == ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE) {
+		set_csd_min_size(wl);
+	} else if (mode == ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE) {
+		xdg_toplevel_set_min_size(wl->xdg_toplevel, 0, 0);
+	}
+	qunlock(&wayland_lock);
+}
+
+static const struct zxdg_toplevel_decoration_v1_listener xdg_toplevel_decoration_listener = {
+	.configure = xdg_toplevel_decoration_configure,
+};
+
 static void xdg_surface_configure(void *data, struct xdg_surface *xdg_surface, uint32_t serial) {
 	DEBUG("xdg_surface_configure\n");
 	const Client* c = data;
@@ -392,7 +450,20 @@ void xdg_toplevel_configure(void *data, struct xdg_toplevel *xdg_toplevel,
 
 	width *= wl_output_scale_factor;
 	height *= wl_output_scale_factor;
-	Rectangle r = Rect(0, 0, width, height);
+	int content_w = width;
+	int content_h = height;
+	int t = wl->csd_thickness;
+	content_w = width - 2 * t;
+	content_h = height - 2 * t;
+	if (content_w < 1) {
+		content_w = 1;
+	}
+	if (content_h < 1) {
+		content_h = 1;
+	}
+	wl->surface_w = width;
+	wl->surface_h = height;
+	Rectangle r = Rect(0, 0, content_w, content_h);
 	if (eqrect(r, wl->memimage->r)) {
 		// The size didn't change, so nothing to do.
 		qunlock(&wayland_lock);
@@ -466,8 +537,24 @@ void wl_pointer_enter(void *data,struct wl_pointer *wl_pointer, uint32_t serial,
 	WaylandClient *wl = (WaylandClient*) c->view;
 	qlock(&wayland_lock);
 
-	wl->mouse_x = wl_fixed_to_int(surface_x) * wl_output_scale_factor;
-	wl->mouse_y = wl_fixed_to_int(surface_y) * wl_output_scale_factor;
+	int x = (int)(wl_fixed_to_double(surface_x) * wl_output_scale_factor + 0.5);
+	int y = (int)(wl_fixed_to_double(surface_y) * wl_output_scale_factor + 0.5);
+	int w = Dx(wl->memimage->r);
+	int h = Dy(wl->memimage->r);
+	x -= wl->content_offset_x;
+	y -= wl->content_offset_y;
+	if (x < 0) {
+		x = 0;
+	} else if (w > 0 && x >= w) {
+		x = w - 1;
+	}
+	if (y < 0) {
+		y = 0;
+	} else if (h > 0 && y >= h) {
+		y = h - 1;
+	}
+	wl->mouse_x = x;
+	wl->mouse_y = y;
 
 	wl_pointer_set_cursor(wl->wl_pointer, serial, wl->wl_surface_cursor, 0, 0);
 
@@ -492,14 +579,30 @@ void wl_pointer_motion(void *data, struct wl_pointer *wl_pointer, uint32_t time,
 	WaylandClient *wl = (WaylandClient*) c->view;
 	qlock(&wayland_lock);
 
-	wl->mouse_x = wl_fixed_to_int(surface_x) * wl_output_scale_factor;
-	wl->mouse_y = wl_fixed_to_int(surface_y) * wl_output_scale_factor;
-	int x = wl->mouse_x;
-	int y = wl->mouse_y;
+	int x = (int)(wl_fixed_to_double(surface_x) * wl_output_scale_factor + 0.5);
+	int y = (int)(wl_fixed_to_double(surface_y) * wl_output_scale_factor + 0.5);
+	int w = Dx(wl->memimage->r);
+	int h = Dy(wl->memimage->r);
+	x -= wl->content_offset_x;
+	y -= wl->content_offset_y;
+	if (x < 0) {
+		x = 0;
+	} else if (w > 0 && x >= w) {
+		x = w - 1;
+	}
+	if (y < 0) {
+		y = 0;
+	} else if (h > 0 && y >= h) {
+		y = h - 1;
+	}
+	wl->mouse_x = x;
+	wl->mouse_y = y;
+	int mx = wl->mouse_x;
+	int my = wl->mouse_y;
 	int b = wl->buttons;
 
 	qunlock(&wayland_lock);
-	gfx_mousetrack(c, x, y, b, (uint) time);
+	gfx_mousetrack(c, mx, my, b, (uint) time);
 }
 
 void wl_pointer_button(void *data, struct wl_pointer *wl_pointer, uint32_t serial,
@@ -985,14 +1088,28 @@ static void rpc_setmouse(Client *c, Point p) {
 	struct zwp_locked_pointer_v1 *lock = zwp_pointer_constraints_v1_lock_pointer(
 		pointer_constraints, wl->wl_surface, wl->wl_pointer, NULL,
 		ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_PERSISTENT);
-	int x = wl_fixed_from_int(p.x / wl_output_scale_factor);
-	int y = wl_fixed_from_int(p.y / wl_output_scale_factor);
+	int x = wl_fixed_from_int((p.x + wl->content_offset_x) / wl_output_scale_factor);
+	int y = wl_fixed_from_int((p.y + wl->content_offset_y) / wl_output_scale_factor);
 	zwp_locked_pointer_v1_set_cursor_position_hint(lock, x, y);
 	wl_surface_commit(wl->wl_surface);
 	zwp_locked_pointer_v1_destroy(lock);
 
 	wl->mouse_x = wl_fixed_to_int(x) * wl_output_scale_factor;
 	wl->mouse_y = wl_fixed_to_int(y) * wl_output_scale_factor;
+	wl->mouse_x -= wl->content_offset_x;
+	wl->mouse_y -= wl->content_offset_y;
+	int w = Dx(wl->memimage->r);
+	int h = Dy(wl->memimage->r);
+	if (wl->mouse_x < 0) {
+		wl->mouse_x = 0;
+	} else if (w > 0 && wl->mouse_x >= w) {
+		wl->mouse_x = w - 1;
+	}
+	if (wl->mouse_y < 0) {
+		wl->mouse_y = 0;
+	} else if (h > 0 && wl->mouse_y >= h) {
+		wl->mouse_y = h - 1;
+	}
 
 	int mx = wl->mouse_x;
 	int my = wl->mouse_y;
@@ -1031,17 +1148,67 @@ WaylandBuffer *get_xrgb8888_buffer(int w, int h) {
 	return b;
 }
 
+static void draw_csd_frame(WaylandBuffer *b, Memimage *img, int surface_w, int surface_h, int thickness) {
+	uint32_t border = 0x0055AAAA; // rio activeborder color
+
+	if (surface_w < thickness * 2 || surface_h < thickness * 2) {
+		return;
+	}
+	int img_w = Dx(img->r);
+	int content_w = img_w;
+	int content_h = Dy(img->r);
+	int max_w = surface_w - 2 * thickness;
+	int max_h = surface_h - 2 * thickness;
+	if (content_w > max_w) {
+		content_w = max_w;
+	}
+	if (content_h > max_h) {
+		content_h = max_h;
+	}
+	if (content_w <= 0 || content_h <= 0) {
+		return;
+	}
+
+	uint32_t *pixels = (uint32_t*) b->data;
+	int total = surface_w * surface_h;
+	for (int i = 0; i < total; i++) {
+		pixels[i] = border;
+	}
+
+	uint8_t *src = (uint8_t*) img->data->bdata;
+	int src_stride = img_w * 4;
+	for (int y = 0; y < content_h; y++) {
+		uint8_t *dstrow = (uint8_t*) (pixels + (y + thickness) * surface_w + thickness);
+		memcpy(dstrow, src + y * src_stride, content_w * 4);
+	}
+}
+
 static void rpc_flush(Client *c, Rectangle r) {
 	WaylandClient *wl = (WaylandClient*) c->view;
 	qlock(&wayland_lock);
 
 	if (wl->configured) {
-		int w = Dx(wl->memimage->r);
-		int h = Dy(wl->memimage->r);
+		int content_w = Dx(wl->memimage->r);
+		int content_h = Dy(wl->memimage->r);
+		int w = content_w;
+		int h = content_h;
+		int t = wl->csd_thickness;
+		if (t > 0) {
+			w = wl->surface_w > 0 ? wl->surface_w : content_w + 2 * t;
+			h = wl->surface_h > 0 ? wl->surface_h : content_h + 2 * t;
+		}
 		WaylandBuffer *b = get_xrgb8888_buffer(w, h);
-		memcpy(b->data, (char*) wl->memimage->data->bdata, b->size);
+		if (t > 0) {
+			draw_csd_frame(b, wl->memimage, w, h, t);
+		} else {
+			memcpy(b->data, (char*) wl->memimage->data->bdata, b->size);
+		}
 		wl_surface_attach(wl->wl_surface, b->wl_buffer, 0, 0);
-		wl_surface_damage_buffer(wl->wl_surface, r.min.x, r.min.y, Dx(r), Dy(r));
+		if (t > 0) {
+			wl_surface_damage_buffer(wl->wl_surface, 0, 0, w, h);
+		} else {
+			wl_surface_damage_buffer(wl->wl_surface, r.min.x, r.min.y, Dx(r), Dy(r));
+		}
 		wl_surface_commit(wl->wl_surface);
 		wl_display_flush(wl_display);
 	}
@@ -1097,18 +1264,31 @@ Memimage *rpc_attach(Client *c, char *label, char *winsize) {
 		struct zxdg_toplevel_decoration_v1 *d =
 			zxdg_decoration_manager_v1_get_toplevel_decoration(
 				decoration_manager, wl->xdg_toplevel);
+		zxdg_toplevel_decoration_v1_add_listener(
+			d, &xdg_toplevel_decoration_listener, c);
 		zxdg_toplevel_decoration_v1_set_mode(d,
 			ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+		wl->decoration_mode = ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE;
+		wl->xdg_decoration = d;
+	} else {
+		wl->decoration_mode = ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE;
+	}
+	update_csd_metrics(wl);
+	if (wl->decoration_mode == ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE) {
+		set_csd_min_size(wl);
 	}
 
 	// TODO: parse winsize.
-	int w = 640*wl_output_scale_factor;
-	int h = 480*wl_output_scale_factor;
-	Rectangle r = Rect(0, 0, w, h);
+	int content_w = 640*wl_output_scale_factor;
+	int content_h = 480*wl_output_scale_factor;
+	Rectangle r = Rect(0, 0, content_w, content_h);
 	wl->memimage = _allocmemimage(r, XRGB32);
 	c->mouserect = r;
 	c->displaydpi = 110 * wl_output_scale_factor;
 	wl_surface_set_buffer_scale(wl->wl_surface, wl_output_scale_factor);
+	int t = wl->csd_thickness;
+	wl->surface_w = content_w + 2 * t;
+	wl->surface_h = content_h + 2 * t;
 	wl_surface_commit(wl->wl_surface);
 	wl_display_flush(wl_display);
 
