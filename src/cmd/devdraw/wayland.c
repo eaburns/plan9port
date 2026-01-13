@@ -43,6 +43,8 @@ struct WaylandClient {
 	int mouse_x;
 	int mouse_y;
 	int buttons;
+	int surface_mouse_x;
+	int surface_mouse_y;
 
 	// Booleans indicating whether control or alt are currently held.
 	int ctl;
@@ -539,6 +541,8 @@ void wl_pointer_enter(void *data,struct wl_pointer *wl_pointer, uint32_t serial,
 
 	int x = (int)(wl_fixed_to_double(surface_x) * wl_output_scale_factor + 0.5);
 	int y = (int)(wl_fixed_to_double(surface_y) * wl_output_scale_factor + 0.5);
+	wl->surface_mouse_x = x;
+	wl->surface_mouse_y = y;
 	int w = Dx(wl->memimage->r);
 	int h = Dy(wl->memimage->r);
 	x -= wl->content_offset_x;
@@ -581,6 +585,8 @@ void wl_pointer_motion(void *data, struct wl_pointer *wl_pointer, uint32_t time,
 
 	int x = (int)(wl_fixed_to_double(surface_x) * wl_output_scale_factor + 0.5);
 	int y = (int)(wl_fixed_to_double(surface_y) * wl_output_scale_factor + 0.5);
+	wl->surface_mouse_x = x;
+	wl->surface_mouse_y = y;
 	int w = Dx(wl->memimage->r);
 	int h = Dy(wl->memimage->r);
 	x -= wl->content_offset_x;
@@ -646,6 +652,44 @@ void wl_pointer_button(void *data, struct wl_pointer *wl_pointer, uint32_t seria
 		}
 	}
 	DEBUG("wl_pointer_button: mask=%x\n", mask);
+
+	int start_resize = 0;
+	int start_move = 0;
+	uint32_t edges = 0;
+	if (state == WL_POINTER_BUTTON_STATE_PRESSED && button == BTN_LEFT &&
+		wl->csd_thickness > 0 && !wl->ctl && !wl->alt) {
+		int t = wl->csd_thickness;
+		int w = wl->surface_w > 0 ? wl->surface_w : Dx(wl->memimage->r) + 2 * t;
+		int h = wl->surface_h > 0 ? wl->surface_h : Dy(wl->memimage->r) + 2 * t;
+		int sx = wl->surface_mouse_x;
+		int sy = wl->surface_mouse_y;
+		if (sx < t) {
+			edges |= XDG_TOPLEVEL_RESIZE_EDGE_LEFT;
+		} else if (sx >= w - t) {
+			edges |= XDG_TOPLEVEL_RESIZE_EDGE_RIGHT;
+		}
+		if (sy < t) {
+			edges |= XDG_TOPLEVEL_RESIZE_EDGE_TOP;
+		} else if (sy >= h - t) {
+			edges |= XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM;
+		}
+		if (edges == XDG_TOPLEVEL_RESIZE_EDGE_TOP &&
+			sy < t && sx >= t && sx < w - t) {
+			start_move = 1;
+			edges = 0;
+		} else if (edges != 0) {
+			start_resize = 1;
+		}
+	}
+	if (start_resize || start_move) {
+		qunlock(&wayland_lock);
+		if (start_resize) {
+			xdg_toplevel_resize(wl->xdg_toplevel, wl_seat, serial, edges);
+		} else {
+			xdg_toplevel_move(wl->xdg_toplevel, wl_seat, serial);
+		}
+		return;
+	}
 
 	switch (state) {
 	case WL_POINTER_BUTTON_STATE_PRESSED:
@@ -1096,6 +1140,8 @@ static void rpc_setmouse(Client *c, Point p) {
 
 	wl->mouse_x = wl_fixed_to_int(x) * wl_output_scale_factor;
 	wl->mouse_y = wl_fixed_to_int(y) * wl_output_scale_factor;
+	wl->surface_mouse_x = wl->mouse_x;
+	wl->surface_mouse_y = wl->mouse_y;
 	wl->mouse_x -= wl->content_offset_x;
 	wl->mouse_y -= wl->content_offset_y;
 	int w = Dx(wl->memimage->r);
