@@ -20,6 +20,7 @@
 #include "wayland-pointer-constraints.h"
 #include "wayland-xdg-decoration.h"
 #include "wayland-xdg-shell.h"
+#include "wayland-text-input.h"
 
 // alt+click and ctl+click are mapped to mouse buttons
 // to support single button mice.
@@ -34,6 +35,13 @@ struct WaylandBuffer {
 	struct wl_buffer* wl_buffer;
 };
 typedef struct WaylandBuffer WaylandBuffer;
+
+struct text_input_state {
+	uint32_t serial;
+	Rune commit[16];
+	Rune preedit[16];
+	Rune dot[16];
+};
 
 struct WaylandClient {
 	// The screen image written to by the client, and read by this driver.
@@ -54,8 +62,16 @@ struct WaylandClient {
 
 	// Key repeat configuration. Can be changed by
 	// wl_surface_repeat_info events.
+	int repeat_disabled;
 	int repeat_interval_ms;
 	int repeat_delay_ms;
+
+	// State for "key repeat" for the mouse scroll wheel.
+	// This allows touchpad devices to have accelerated scrolling.
+	int repeat_scroll_button;
+	int repeat_scroll_count;
+	int repeat_scroll_rate_ms;
+	int repeat_scroll_next_ms;
 
 	// The Wayland surface for this window
 	// and its corresponding xdg objects.
@@ -70,6 +86,7 @@ struct WaylandClient {
 	// or scrolling is active, to implement key repeat and
 	// inertial scrolling.
 	struct wl_callback *wl_key_repeat_callback;
+	struct wl_callback *wl_scroll_repeat_callback;
 
 	// The mouse pointer and the surface for the current cursor.
 	struct wl_pointer *wl_pointer;
@@ -81,6 +98,10 @@ struct WaylandClient {
 	struct xkb_context *xkb_context;
 	struct xkb_keymap *xkb_keymap;
 	struct xkb_state *xkb_state;
+
+	// For input methods
+	struct zwp_text_input_v3 *text_input;
+	struct text_input_state ime;
 };
 typedef struct WaylandClient WaylandClient;
 
@@ -104,6 +125,7 @@ uint32_t keyboard_enter_serial;
 // Need to NULL check them before using.
 static struct zxdg_decoration_manager_v1 *decoration_manager;
 static struct zwp_pointer_constraints_v1 *pointer_constraints;
+static struct zwp_text_input_manager_v3 *text_input_manager;
 
 // The wl output scale factor reported by wl_output.
 // We only set it if we get th event before entering the graphics loop.
@@ -116,6 +138,9 @@ int entered_gfx_loop = 0;
 int key_repeat_delay_ms = 500;
 // The number of ms between repeats of a repeating key.
 int key_repeat_ms = 100;
+// The maximum number of ms between repeats of a scroll.
+// This is scaled by the number of repeating scrolls pending.
+int scroll_repeat_ms = 100;
 
 // A pool of xrgb888 buffers used for drawing to the screen.
 // When drawing, we give ownership of the buffer's memory to the compositor.
@@ -165,6 +190,9 @@ static void registry_global(void *data, struct wl_registry *wl_registry,
 	} else if (strcmp(interface, zwp_pointer_constraints_v1_interface.name) == 0) {
 		pointer_constraints = wl_registry_bind(wl_registry, name,
 			&zwp_pointer_constraints_v1_interface, 1);
+
+	} else if (strcmp(interface, zwp_text_input_manager_v3_interface.name) == 0) {
+		text_input_manager = wl_registry_bind(wl_registry, name, &zwp_text_input_manager_v3_interface, 1);
 	}
 }
 
@@ -428,8 +456,7 @@ static void wl_callback_key_repeat(void *data, struct wl_callback *wl_callback, 
 
 	int repetitions = 0;
 	int repeat_rune = wl->repeat_rune;
-
-	if (wl->repeat_interval_ms == 0 || wl->repeat_rune == 0) {
+	if (wl->repeat_disabled || wl->repeat_interval_ms == 0 || wl->repeat_rune == 0) {
 		goto done;
 	}
 
@@ -458,6 +485,44 @@ done:
 
 static const struct wl_callback_listener wl_callback_key_repeat_listener = {
 	.done = wl_callback_key_repeat,
+};
+
+static const struct wl_callback_listener wl_callback_scroll_listener;
+
+static void wl_callback_scroll_repeat(void *data, struct wl_callback *wl_callback, uint32_t time) {
+	Client* c = data;
+	WaylandClient *wl = (WaylandClient*) c->view;
+
+	wl_callback_destroy(wl_callback);
+	qlock(&wayland_lock);
+
+	int x = wl->mouse_x;
+	int y = wl->mouse_y;
+	int repeat_scroll_button = 0;
+	if (wl->repeat_scroll_button && time >= wl->repeat_scroll_next_ms) {
+		repeat_scroll_button = wl->repeat_scroll_button | wl->buttons;
+		wl->repeat_scroll_count--;
+		if (wl->repeat_scroll_count == 0) {
+			wl->repeat_scroll_button = 0;
+		} else {
+			wl->repeat_scroll_next_ms = time + scroll_repeat_ms/wl->repeat_scroll_count;
+		}
+	}
+
+	if (wl->repeat_scroll_count > 0) {
+		wl_callback = wl_surface_frame(wl->wl_surface);
+		wl_callback_add_listener(wl_callback, &wl_callback_scroll_listener, c);
+		wl_surface_commit(wl->wl_surface);
+	}
+	qunlock(&wayland_lock);
+
+	if (repeat_scroll_button) {
+		gfx_mousetrack(c, x, y, repeat_scroll_button, (uint) time);
+	}
+}
+
+static const struct wl_callback_listener wl_callback_scroll_listener = {
+	.done = wl_callback_scroll_repeat,
 };
 
 void wl_pointer_enter(void *data,struct wl_pointer *wl_pointer, uint32_t serial,
@@ -582,6 +647,15 @@ void wl_pointer_axis(void *data, struct wl_pointer *wl_pointer, uint32_t time,
 		b |= 1 << 3;
 	} else if (value > 0) {
 		b |= 1 << 4;
+	}
+	int mag = fabs(value);
+	if (mag > 1) {
+		wl->repeat_scroll_button = b;
+		wl->repeat_scroll_count = mag;
+		wl->repeat_scroll_next_ms = time + scroll_repeat_ms/wl->repeat_scroll_count;
+		wl->wl_scroll_repeat_callback = wl_surface_frame(wl->wl_surface);
+		wl_callback_add_listener(wl->wl_scroll_repeat_callback,
+				&wl_callback_scroll_listener, c);
 	}
 	b |= wl->buttons;
 
@@ -812,6 +886,119 @@ static const struct wl_keyboard_listener keyboard_listener = {
 	.key = wl_keyboard_key,
 	.modifiers = wl_keyboard_modifiers,
 	.repeat_info = wl_keyboard_repeat_info,
+};
+
+void zwp_text_input_v3_enter(void *data, struct zwp_text_input_v3 *text_input,
+	struct wl_surface *surface) {
+	DEBUG("zwp_text_input_v3_enter()\n");
+	Client* c = data;
+	WaylandClient *wl = (WaylandClient*) c->view;
+
+	qlock(&wayland_lock);
+	memset(&wl->ime, 0, sizeof wl->ime);
+	zwp_text_input_v3_enable(wl->text_input);
+	zwp_text_input_v3_commit(wl->text_input);
+	wl->ime.serial++;
+	wl->repeat_disabled = 1;
+	qunlock(&wayland_lock);
+}
+
+void zwp_text_input_v3_leave(void *data, struct zwp_text_input_v3 *text_input,
+	struct wl_surface *surface) {
+	DEBUG("zwp_text_input_v3_leave()\n");
+	Client* c = data;
+	WaylandClient *wl = (WaylandClient*) c->view;
+
+	qlock(&wayland_lock);
+	zwp_text_input_v3_disable(wl->text_input);
+	zwp_text_input_v3_commit(wl->text_input);
+	wl->repeat_disabled = 0;
+	qunlock(&wayland_lock);
+}
+
+void zwp_text_input_v3_preedit_string(void *data, struct zwp_text_input_v3 *text_input,
+	const char *text, int cursor_begin, int cursor_end) {
+	DEBUG("zwp_text_input_v3_preedit_string(text=%s, begin=%d, end=%d)\n", text, cursor_begin, cursor_end);
+	Client* c = data;
+	WaylandClient *wl = (WaylandClient*) c->view;
+
+	qlock(&wayland_lock);
+	runesnprint(wl->ime.preedit, sizeof wl->ime.preedit, "%s", text);
+	qunlock(&wayland_lock);
+}
+
+void zwp_text_input_v3_commit_string(void *data, struct zwp_text_input_v3 *text_input,
+	const char *text) {
+	DEBUG("zwp_text_input_v3_commit_string(text=%s)\n", text);
+	Client* c = data;
+	WaylandClient *wl = (WaylandClient*) c->view;
+
+	qlock(&wayland_lock);
+	runesnprint(wl->ime.commit, sizeof wl->ime.commit, "%s", text);
+	qunlock(&wayland_lock);
+}
+
+void zwp_text_input_v3_delete_surrounding_text(void *data, struct zwp_text_input_v3 *text_input,
+	uint32_t before_length, uint32_t after_length) {
+
+	// We shouldn't get these events because we never call set_surrounding_text
+	fprint(2, "unsupported zwp_text_input_v3::delete_surrounding_text(before=%ud, after=%ud)\n",
+		before_length, after_length);
+}
+
+int runeprefix(Rune *s1, Rune *s2) {
+	if (runestrstr(s1, s2) == s1) {
+		return runestrlen(s2);
+	} else if (runestrstr(s2, s1) == s2) {
+		return runestrlen(s1);
+	}
+	return 0;
+}
+
+// Try to replace s1, which is presumed to be displayed on the screen, with s2,
+// using a minimal number of key strokes. We make the assumption that the backspace
+// character deletes one rune.
+void replace_text(Client *c, Rune *s1, Rune *s2) {
+	int prefix = runeprefix(s1, s2);
+	int del = runestrlen(s1) - prefix;
+	int add = runestrlen(s2) - prefix;
+
+	for (int i = 0; i < del; i++) {
+		gfx_keystroke(c, Kbs);
+	}
+	for (int i = 0; i < add; i++) {
+		gfx_keystroke(c, s2[prefix + i]);
+	}
+}
+
+void zwp_text_input_v3_done(void *data, struct zwp_text_input_v3 *text_input,
+	uint32_t serial) {
+	DEBUG("zwp_text_input_v3_done(serial=%d)\n", serial);
+
+	Client* c = data;
+	WaylandClient *wl = (WaylandClient*) c->view;
+
+	qlock(&wayland_lock);
+
+	replace_text(c, wl->ime.dot, wl->ime.preedit);
+	runestrcpy(wl->ime.dot, wl->ime.preedit);
+	wl->ime.preedit[0] = '\0';
+
+	if (runestrlen(wl->ime.commit) > 0) {
+		replace_text(c, wl->ime.dot, wl->ime.commit);
+		wl->ime.commit[0] = '\0';
+		wl->ime.dot[0] = '\0';
+	}
+	qunlock(&wayland_lock);
+}
+
+static const struct zwp_text_input_v3_listener text_input_listener = {
+	.enter = zwp_text_input_v3_enter,
+	.leave = zwp_text_input_v3_leave,
+	.preedit_string = zwp_text_input_v3_preedit_string,
+	.commit_string = zwp_text_input_v3_commit_string,
+	.delete_surrounding_text = zwp_text_input_v3_delete_surrounding_text,
+	.done = zwp_text_input_v3_done,
 };
 
 void	gfx_main(void) {
@@ -1099,6 +1286,14 @@ Memimage *rpc_attach(Client *c, char *label, char *winsize) {
 				decoration_manager, wl->xdg_toplevel);
 		zxdg_toplevel_decoration_v1_set_mode(d,
 			ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+	}
+
+	if (text_input_manager != NULL) {
+		wl->text_input = zwp_text_input_manager_v3_get_text_input(
+			text_input_manager, wl_seat);
+		if (wl->text_input != NULL) {
+			zwp_text_input_v3_add_listener(wl->text_input, &text_input_listener, c);
+		}
 	}
 
 	// TODO: parse winsize.
